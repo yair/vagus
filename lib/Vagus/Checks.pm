@@ -136,18 +136,65 @@ sub check_mail {
 sub check_node {
     my (%args) = @_;
     my $node_name    = $args{node_name}    // 'zhizi-zeresh';
-    my $gateway_url  = $args{gateway_url}  // 'http://127.0.0.1:18789';
-    my $gateway_token = $args{gateway_token};
     my $disabled     = $args{disabled}     // 0;
 
     if ($disabled) {
         return { status => 'disabled', node => $node_name, reason => 'check disabled (travel/maintenance)' };
     }
 
-    # Check if the node's paired device entry exists and has a recent token
+    # SSH config — primary liveness check
+    my $ssh_host = $args{ssh_host} // 'localhost';
+    my $ssh_port = $args{ssh_port} // 2222;
+    my $ssh_user = $args{ssh_user} // 'zeresh';
+    my $ssh_check_cmd = $args{ssh_check_cmd}
+        // "ps aux | grep 'openclaw-node' | grep -v grep | wc -l";
+
+    # Try SSH probe — this is the definitive check
+    my $ssh_cmd = "ssh -p $ssh_port -o ConnectTimeout=5 -o StrictHostKeyChecking=no "
+                . "-o BatchMode=yes $ssh_user\@$ssh_host '$ssh_check_cmd' 2>/dev/null";
+
+    my $ssh_output = `$ssh_cmd`;
+    my $ssh_exit = $? >> 8;
+
+    if ($ssh_exit == 0) {
+        chomp $ssh_output;
+        my $proc_count = int($ssh_output || 0);
+
+        if ($proc_count > 0) {
+            # Node process is running — all good
+            # Touch heartbeat file for historical tracking
+            my $heartbeat_file = "/home/oc/.vagus/state/node-heartbeat-$node_name";
+            if (open my $fh, '>', $heartbeat_file) {
+                print $fh time() . "\n";
+                close $fh;
+            }
+            return {
+                status => 'ok',
+                node   => $node_name,
+                check  => 'ssh',
+                procs  => $proc_count,
+            };
+        } else {
+            # SSH works but openclaw-node process not running
+            return {
+                status => 'offline',
+                node   => $node_name,
+                check  => 'ssh',
+                reason => 'SSH reachable but openclaw-node process not running',
+            };
+        }
+    }
+
+    # SSH failed — tunnel might be down, or machine is off
+    # Fall back to paired.json token staleness as a secondary signal
     my $paired_file = '/home/oc/.openclaw/devices/paired.json';
     unless (-f $paired_file) {
-        return { status => 'unknown', node => $node_name, reason => 'no paired devices file' };
+        return {
+            status => 'unknown',
+            node   => $node_name,
+            check  => 'ssh-failed',
+            reason => "SSH unreachable (exit=$ssh_exit) and no paired devices file",
+        };
     }
 
     my $paired;
@@ -160,7 +207,7 @@ sub check_node {
         $paired = JSON::PP::decode_json($json);
     };
     if ($@) {
-        return { status => 'unknown', node => $node_name, reason => "parse error: $@" };
+        return { status => 'unknown', node => $node_name, check => 'ssh-failed', reason => "SSH unreachable, paired.json parse error: $@" };
     }
 
     # Find the node entry
@@ -173,7 +220,7 @@ sub check_node {
     }
 
     unless ($node_entry) {
-        return { status => 'error', node => $node_name, reason => 'node not found in paired devices' };
+        return { status => 'offline', node => $node_name, check => 'ssh-failed', reason => "SSH unreachable and node not found in paired devices" };
     }
 
     # Check last used timestamp from the node's operator token
@@ -183,56 +230,35 @@ sub check_node {
         $last_used = $lu if defined $lu && (!defined $last_used || $lu > $last_used);
     }
 
-    my $hours_since_seen;
-    if (defined $last_used) {
-        $hours_since_seen = (time() * 1000 - $last_used) / (3600 * 1000);
-    }
-
-    # Primary signal: heartbeat file written by the node every 5 min.
-    # The node runs a cron/launchd that touches a file on bakkies.
-    # If the file is stale, the node is down.
-    my $heartbeat_file = $args{heartbeat_file}
-        // "/home/oc/.vagus/state/node-heartbeat-$node_name";
-
     my $stale_threshold_hours = $args{stale_hours} // 1;
-    my $hours_since_heartbeat;
 
-    if (-f $heartbeat_file) {
-        my $mtime = (stat $heartbeat_file)[9] // 0;
-        $hours_since_heartbeat = (time() - $mtime) / 3600;
-    }
+    if (defined $last_used) {
+        my $hours_since = (time() * 1000 - $last_used) / (3600 * 1000);
+        my $age_str = sprintf("%.1f", $hours_since);
 
-    # Secondary signal: paired.json token lastUsedAtMs
-    # Useful as fallback if heartbeat file doesn't exist yet
-    my $best_age = $hours_since_heartbeat // $hours_since_seen;
-    my $age_str = defined $best_age ? sprintf("%.1f", $best_age) : 'unknown';
-    my $age_source = defined $hours_since_heartbeat ? 'heartbeat' : 'token';
-
-    if (!defined $best_age) {
-        # No heartbeat file and no token activity — unknown state
+        if ($hours_since > $stale_threshold_hours) {
+            return {
+                status => 'offline',
+                node   => $node_name,
+                check  => 'ssh-failed+token-stale',
+                hours_since_seen => $age_str,
+                reason => "SSH unreachable and token stale (${age_str}h)",
+            };
+        }
         return {
-            status => 'unknown',
+            status => 'ok',
             node   => $node_name,
+            check  => 'token-only',
             hours_since_seen => $age_str,
-            reason => 'no heartbeat file and no recent token activity',
-        };
-    }
-
-    if ($best_age > $stale_threshold_hours) {
-        return {
-            status => 'offline',
-            node   => $node_name,
-            hours_since_seen => $age_str,
-            age_source => $age_source,
-            reason => "node heartbeat stale (>${stale_threshold_hours}h, source=$age_source)",
+            reason => "SSH unreachable but token recent (${age_str}h) — tunnel may be down",
         };
     }
 
     return {
-        status => 'ok',
+        status => 'offline',
         node   => $node_name,
-        hours_since_seen => $age_str,
-        age_source => $age_source,
+        check  => 'ssh-failed+no-token',
+        reason => 'SSH unreachable and no recent token activity',
     };
 }
 

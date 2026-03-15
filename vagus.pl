@@ -78,13 +78,15 @@ if (ref $nodes_conf eq 'HASH') {
         next unless ref $nc eq 'HASH';
         $checks{nodes}{$node_name} = Vagus::Checks::check_node(
             node_name     => $node_name,
-            gateway_url   => $conf->get('openclaw.gateway_url'),
-            gateway_token => $conf->get('openclaw.gateway_token'),
             disabled      => !($nc->{enabled} // 1),
             stale_hours   => $nc->{stale_hours} // 0.5,
+            ssh_host      => $nc->{ssh_host} // 'localhost',
+            ssh_port      => $nc->{ssh_port} // 2222,
+            ssh_user      => $nc->{ssh_user} // 'zeresh',
+            ssh_check_cmd => $nc->{ssh_check_cmd},
         );
         my $nc_result = $checks{nodes}{$node_name};
-        Vagus::Log::info("Node $node_name: $nc_result->{status}" .
+        Vagus::Log::info("Node $node_name: $nc_result->{status} (check=$nc_result->{check})" .
             ($nc_result->{hours_since_seen} ? " (last_seen=${\ $nc_result->{hours_since_seen}}h)" : ""));
     }
 }
