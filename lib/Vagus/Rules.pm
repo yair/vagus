@@ -163,7 +163,32 @@ sub evaluate {
         }
     }
 
-    # --- Rule 5: Batch work (lowest priority, only when coast is clear) ---
+    # --- Rule 5: Node offline ---
+    if ($checks->{nodes} && ref $checks->{nodes} eq 'HASH') {
+        for my $node_name (sort keys %{$checks->{nodes}}) {
+            my $nc = $checks->{nodes}{$node_name};
+            next if !$nc || $nc->{status} eq 'ok' || $nc->{status} eq 'disabled' || $nc->{status} eq 'unknown';
+
+            if ($nc->{status} eq 'offline') {
+                my $alert_key = "node_offline_$node_name";
+                $alert_key =~ s/[^a-zA-Z0-9_]/_/g;
+                my $alert_age = $state->age_of('wakes.json', 'last_wake', $alert_key, 'ts');
+                my $cooldown = ($conf->get("nodes.$node_name.alert_cooldown_hours") // 2) * 3600;
+
+                if (!defined $alert_age || $alert_age > $cooldown) {
+                    return {
+                        rule    => 'node_offline',
+                        action  => 'telegram_jay',
+                        message => "⚠️ *Node offline: $node_name*\nLast seen: $nc->{hours_since_seen}h ago.\nBrowser and remote exec unavailable.",
+                        state_update => { file => 'wakes.json', key => "last_wake.$alert_key.ts", val => $now_ts },
+                        escalation => { check => 'node', result => 'offline', node => $node_name, action => 'telegram_jay' },
+                    };
+                }
+            }
+        }
+    }
+
+    # --- Rule 6: Batch work (lowest priority, only when coast is clear) ---
     # Deferred for now. Placeholder for future todo-driven batch work.
     # When implemented: check $is_quiet, $is_working, usage levels, cooldown,
     # then pick a todo and wake a worker agent.

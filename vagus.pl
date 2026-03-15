@@ -70,6 +70,25 @@ Vagus::Log::info("Mail: imap_running=$checks{mail}{imap_running}" .
         ? " junior_age=" . int($checks{mail}{hours_since_junior_activity}) . "h"
         : " junior_age=unknown"));
 
+# 4. Node checks
+my $nodes_conf = $conf->get('nodes') // {};
+if (ref $nodes_conf eq 'HASH') {
+    for my $node_name (sort keys %$nodes_conf) {
+        my $nc = $nodes_conf->{$node_name};
+        next unless ref $nc eq 'HASH';
+        $checks{nodes}{$node_name} = Vagus::Checks::check_node(
+            node_name     => $node_name,
+            gateway_url   => $conf->get('openclaw.gateway_url'),
+            gateway_token => $conf->get('openclaw.gateway_token'),
+            disabled      => !($nc->{enabled} // 1),
+            stale_hours   => $nc->{stale_hours} // 0.5,
+        );
+        my $nc_result = $checks{nodes}{$node_name};
+        Vagus::Log::info("Node $node_name: $nc_result->{status}" .
+            ($nc_result->{hours_since_seen} ? " (last_seen=${\ $nc_result->{hours_since_seen}}h)" : ""));
+    }
+}
+
 # --- Update health state ---
 $state->update_key('health.json', 'last_check', Vagus::State::now_ts());
 if ($checks{usage}{status} eq 'ok') {

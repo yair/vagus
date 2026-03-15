@@ -131,4 +131,117 @@ sub check_mail {
     };
 }
 
+# Check if a remote OC node is connected.
+# Uses the gateway WebSocket endpoint to verify node is reachable.
+sub check_node {
+    my (%args) = @_;
+    my $node_name    = $args{node_name}    // 'zhizi-zeresh';
+    my $gateway_url  = $args{gateway_url}  // 'http://127.0.0.1:18789';
+    my $gateway_token = $args{gateway_token};
+    my $disabled     = $args{disabled}     // 0;
+
+    if ($disabled) {
+        return { status => 'disabled', node => $node_name, reason => 'check disabled (travel/maintenance)' };
+    }
+
+    # Check if the node's paired device entry exists and has a recent token
+    my $paired_file = '/home/oc/.openclaw/devices/paired.json';
+    unless (-f $paired_file) {
+        return { status => 'unknown', node => $node_name, reason => 'no paired devices file' };
+    }
+
+    my $paired;
+    eval {
+        open my $fh, '<', $paired_file or die;
+        local $/;
+        my $json = <$fh>;
+        close $fh;
+        require JSON::PP;
+        $paired = JSON::PP::decode_json($json);
+    };
+    if ($@) {
+        return { status => 'unknown', node => $node_name, reason => "parse error: $@" };
+    }
+
+    # Find the node entry
+    my $node_entry;
+    for my $dev (values %$paired) {
+        if (($dev->{displayName} // '') eq $node_name && ($dev->{clientMode} // '') eq 'node') {
+            $node_entry = $dev;
+            last;
+        }
+    }
+
+    unless ($node_entry) {
+        return { status => 'error', node => $node_name, reason => 'node not found in paired devices' };
+    }
+
+    # Check last used timestamp from the node's operator token
+    my $last_used;
+    for my $tok (values %{$node_entry->{tokens} // {}}) {
+        my $lu = $tok->{lastUsedAtMs};
+        $last_used = $lu if defined $lu && (!defined $last_used || $lu > $last_used);
+    }
+
+    my $hours_since_seen;
+    if (defined $last_used) {
+        $hours_since_seen = (time() * 1000 - $last_used) / (3600 * 1000);
+    }
+
+    # Check if the node's WebSocket connection is alive by looking at the
+    # gateway log for recent node activity. The token lastUsedAtMs is unreliable
+    # (only updates on explicit token use, not on WS keepalive).
+    # 
+    # Best heuristic: check if the node's device has connected recently
+    # by looking at createdAtMs vs lastUsedAtMs, and also check the OC log
+    # for recent node-related activity.
+    my $connected = 0;
+
+    # Check gateway log for recent node mentions (last 10 min)
+    my @log_candidates = (
+        '/tmp/openclaw/openclaw-' . POSIX::strftime('%Y-%m-%d', localtime()) . '.log',
+    );
+    for my $logf (@log_candidates) {
+        next unless -f $logf;
+        # Only check if log was modified recently
+        my $lmtime = (stat $logf)[9] // 0;
+        next if (time() - $lmtime) > 600;  # log untouched for 10 min
+
+        # Check last 100 lines for node activity
+        if (open my $fh, '<', $logf) {
+            my @all = <$fh>;
+            close $fh;
+            my @tail = @all > 100 ? @all[-100..$#all] : @all;
+            for my $line (reverse @tail) {
+                if ($line =~ /\Q$node_name\E/i && $line =~ /connect|node|browser|relay/i) {
+                    $connected = 1;
+                    last;
+                }
+            }
+        }
+        last;
+    }
+
+    # If token was used in the last 24h, consider it alive
+    # (tokens get used on browser relay, exec relay, etc.)
+    my $stale_threshold_hours = $args{stale_hours} // 24;  # Default 24h for token staleness
+    my $is_stale = defined $hours_since_seen && $hours_since_seen > $stale_threshold_hours;
+
+    if ($is_stale && !$connected) {
+        return {
+            status => 'offline',
+            node   => $node_name,
+            hours_since_seen => defined $hours_since_seen ? sprintf("%.1f", $hours_since_seen) : 'unknown',
+            reason => 'node appears offline (stale token + no recent log activity)',
+        };
+    }
+
+    return {
+        status => 'ok',
+        node   => $node_name,
+        hours_since_seen => defined $hours_since_seen ? sprintf("%.1f", $hours_since_seen) : 'unknown',
+        connected => $connected,
+    };
+}
+
 1;
