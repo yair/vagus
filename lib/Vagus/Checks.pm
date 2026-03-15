@@ -188,59 +188,51 @@ sub check_node {
         $hours_since_seen = (time() * 1000 - $last_used) / (3600 * 1000);
     }
 
-    # Check if the node's WebSocket connection is alive by looking at the
-    # gateway log for recent node activity. The token lastUsedAtMs is unreliable
-    # (only updates on explicit token use, not on WS keepalive).
-    # 
-    # Best heuristic: check if the node's device has connected recently
-    # by looking at createdAtMs vs lastUsedAtMs, and also check the OC log
-    # for recent node-related activity.
-    my $connected = 0;
+    # Primary signal: heartbeat file written by the node every 5 min.
+    # The node runs a cron/launchd that touches a file on bakkies.
+    # If the file is stale, the node is down.
+    my $heartbeat_file = $args{heartbeat_file}
+        // "/home/oc/.vagus/state/node-heartbeat-$node_name";
 
-    # Check gateway log for recent node mentions (last 10 min)
-    my @log_candidates = (
-        '/tmp/openclaw/openclaw-' . POSIX::strftime('%Y-%m-%d', localtime()) . '.log',
-    );
-    for my $logf (@log_candidates) {
-        next unless -f $logf;
-        # Only check if log was modified recently
-        my $lmtime = (stat $logf)[9] // 0;
-        next if (time() - $lmtime) > 600;  # log untouched for 10 min
+    my $stale_threshold_hours = $args{stale_hours} // 1;
+    my $hours_since_heartbeat;
 
-        # Check last 100 lines for node activity
-        if (open my $fh, '<', $logf) {
-            my @all = <$fh>;
-            close $fh;
-            my @tail = @all > 100 ? @all[-100..$#all] : @all;
-            for my $line (reverse @tail) {
-                if ($line =~ /\Q$node_name\E/i && $line =~ /connect|node|browser|relay/i) {
-                    $connected = 1;
-                    last;
-                }
-            }
-        }
-        last;
+    if (-f $heartbeat_file) {
+        my $mtime = (stat $heartbeat_file)[9] // 0;
+        $hours_since_heartbeat = (time() - $mtime) / 3600;
     }
 
-    # If token was used in the last 24h, consider it alive
-    # (tokens get used on browser relay, exec relay, etc.)
-    my $stale_threshold_hours = $args{stale_hours} // 24;  # Default 24h for token staleness
-    my $is_stale = defined $hours_since_seen && $hours_since_seen > $stale_threshold_hours;
+    # Secondary signal: paired.json token lastUsedAtMs
+    # Useful as fallback if heartbeat file doesn't exist yet
+    my $best_age = $hours_since_heartbeat // $hours_since_seen;
+    my $age_str = defined $best_age ? sprintf("%.1f", $best_age) : 'unknown';
+    my $age_source = defined $hours_since_heartbeat ? 'heartbeat' : 'token';
 
-    if ($is_stale && !$connected) {
+    if (!defined $best_age) {
+        # No heartbeat file and no token activity — unknown state
+        return {
+            status => 'unknown',
+            node   => $node_name,
+            hours_since_seen => $age_str,
+            reason => 'no heartbeat file and no recent token activity',
+        };
+    }
+
+    if ($best_age > $stale_threshold_hours) {
         return {
             status => 'offline',
             node   => $node_name,
-            hours_since_seen => defined $hours_since_seen ? sprintf("%.1f", $hours_since_seen) : 'unknown',
-            reason => 'node appears offline (stale token + no recent log activity)',
+            hours_since_seen => $age_str,
+            age_source => $age_source,
+            reason => "node heartbeat stale (>${stale_threshold_hours}h, source=$age_source)",
         };
     }
 
     return {
         status => 'ok',
         node   => $node_name,
-        hours_since_seen => defined $hours_since_seen ? sprintf("%.1f", $hours_since_seen) : 'unknown',
-        connected => $connected,
+        hours_since_seen => $age_str,
+        age_source => $age_source,
     };
 }
 
