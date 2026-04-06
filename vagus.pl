@@ -78,7 +78,25 @@ if (ref $nodes_conf eq 'HASH') {
         next unless ref $nc eq 'HASH';
         $checks{nodes}{$node_name} = Vagus::Checks::check_node(
             node_name     => $node_name,
-            disabled      => !($nc->{enabled} // 1),
+            disabled      => do {
+                my $en = $nc->{enabled} // 1;
+                # Auto-re-enable if travel_until has passed
+                if (!$en && $nc->{disabled_until}) {
+                    use POSIX qw(strftime);
+                    my $until = $nc->{disabled_until};
+                    $until =~ s/T/ /;
+                    my @t = $until =~ /(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/;
+                    if (@t) {
+                        use Time::Local;
+                        my $until_epoch = Time::Local::timelocal($t[5],$t[4],$t[3],$t[2],$t[1]-1,$t[0]-1900);
+                        if (time() >= $until_epoch) {
+                            Vagus::Log::info("Node travel/maintenance window expired — re-enabling");
+                            $en = 1;
+                        }
+                    }
+                }
+                !$en;
+            },
             stale_hours   => $nc->{stale_hours} // 0.5,
             ssh_host      => $nc->{ssh_host} // 'localhost',
             ssh_port      => $nc->{ssh_port} // 2222,

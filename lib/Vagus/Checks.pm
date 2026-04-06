@@ -94,9 +94,9 @@ sub check_usage {
     };
 }
 
-# Check mail state. Reads from state file written by IMAP watcher or Junior.
-# For now: checks if the IMAP idle watcher process is running,
-# and reads mail state from the Junior triage workspace.
+# Check mail state. Verifies IMAP watcher is running and mail is flowing.
+# Uses multiple signals: IMAP watcher process, triage session activity,
+# and recent mail delivery (Maildir mtime).
 sub check_mail {
     my (%args) = @_;
     my $state = $args{state};  # Vagus::State object
@@ -106,22 +106,34 @@ sub check_mail {
     my $ps = `pgrep -f 'imap-idle' 2>/dev/null`;
     $imap_running = 1 if $ps && $ps =~ /\d+/;
 
-    # Check Junior's last activity (triage workspace)
-    my $triage_dir = '/home/oc/.openclaw/workspace-triage';
-    my $last_activity;
-    if (-d $triage_dir) {
-        # Find most recently modified file
-        my @files = glob("$triage_dir/*");
-        my $newest = 0;
-        for my $f (@files) {
-            my $mtime = (stat $f)[9] // 0;
-            $newest = $mtime if $mtime > $newest;
-        }
-        $last_activity = $newest if $newest > 0;
+    # Check triage session activity via OC sessions registry
+    # (Junior works through hooks + sessions_send, not workspace files)
+    my $triage_sessions = '/home/oc/.openclaw/agents/triage/sessions/sessions.json';
+    my $last_triage_activity;
+    if (-f $triage_sessions) {
+        my $mtime = (stat $triage_sessions)[9] // 0;
+        $last_triage_activity = $mtime if $mtime > 0;
     }
 
-    my $hours_since_activity = defined $last_activity
-        ? (time() - $last_activity) / 3600
+    # Also check the most recent mail arrival in any Maildir
+    my $mail_dir = '/home/oc/mail/zeresh';
+    my $last_mail;
+    if (-d $mail_dir) {
+        # Check new/ and cur/ dirs across all folders for recent mail
+        my @dirs = glob("$mail_dir/*/new $mail_dir/*/cur $mail_dir/INBOX/new $mail_dir/INBOX/cur");
+        for my $d (@dirs) {
+            next unless -d $d;
+            my $mtime = (stat $d)[9] // 0;
+            $last_mail = $mtime if $mtime > ($last_mail // 0);
+        }
+    }
+
+    # Use the most recent signal: triage session activity OR mail delivery
+    my $best_activity = $last_triage_activity // 0;
+    $best_activity = $last_mail if defined $last_mail && $last_mail > $best_activity;
+
+    my $hours_since_activity = $best_activity > 0
+        ? (time() - $best_activity) / 3600
         : undef;
 
     return {
