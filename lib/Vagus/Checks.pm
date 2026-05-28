@@ -147,131 +147,54 @@ sub check_mail {
 # Uses the gateway WebSocket endpoint to verify node is reachable.
 sub check_node {
     my (%args) = @_;
-    my $node_name    = $args{node_name}    // 'zhizi-zeresh';
-    my $disabled     = $args{disabled}     // 0;
+    my $node_name = $args{node_name} // 'zhizi-zeresh';
 
-    if ($disabled) {
+    if ($args{disabled}) {
         return { status => 'disabled', node => $node_name, reason => 'check disabled (travel/maintenance)' };
     }
 
-    # SSH config — primary liveness check
-    my $ssh_host = $args{ssh_host} // 'localhost';
-    my $ssh_port = $args{ssh_port} // 2222;
-    my $ssh_user = $args{ssh_user} // 'zeresh';
-    my $ssh_check_cmd = $args{ssh_check_cmd}
-        // "ps aux | grep 'openclaw-node' | grep -v grep | wc -l";
-
-    # Try SSH probe — this is the definitive check
-    my $ssh_cmd = "ssh -p $ssh_port -o ConnectTimeout=5 -o StrictHostKeyChecking=no "
-                . "-o BatchMode=yes $ssh_user\@$ssh_host '$ssh_check_cmd' 2>/dev/null";
-
-    my $ssh_output = `$ssh_cmd`;
-    my $ssh_exit = $? >> 8;
-
-    if ($ssh_exit == 0) {
-        chomp $ssh_output;
-        my $proc_count = int($ssh_output || 0);
-
-        if ($proc_count > 0) {
-            # Node process is running — all good
-            # Touch heartbeat file for historical tracking
-            my $heartbeat_file = "/home/oc/.vagus/state/node-heartbeat-$node_name";
-            if (open my $fh, '>', $heartbeat_file) {
-                print $fh time() . "\n";
-                close $fh;
-            }
-            return {
-                status => 'ok',
-                node   => $node_name,
-                check  => 'ssh',
-                procs  => $proc_count,
-            };
-        } else {
-            # SSH works but openclaw-node process not running
-            return {
-                status => 'offline',
-                node   => $node_name,
-                check  => 'ssh',
-                reason => 'SSH reachable but openclaw-node process not running',
-            };
-        }
+    # Liveness via the gateway's OWN node registry (authoritative). Replaces the old
+    # `ssh -p 2222 zeresh@localhost` probe + paired.json operator-token staleness, both
+    # of which broke when the SSH tunnel was retired for the tailnet (2026-05-28): the
+    # ssh probe failed outright, and the operator token's lastUsedAtMs tracks
+    # operation-use (frozen ~Feb), NOT connection -- so it falsely reported the node
+    # offline with a bogus "last seen 2181h" while it was in fact connected over the mesh.
+    my $oc  = $args{oc_bin} // '/home/oc/.npm-global/bin/openclaw';
+    my $out = `$oc nodes status --json 2>/dev/null`;
+    my $exit = $? >> 8;
+    if ($exit != 0 || !length $out) {
+        return { status => 'unknown', node => $node_name, check => 'gateway-unreachable',
+                 reason => "could not query 'openclaw nodes status' (exit=$exit)" };
     }
 
-    # SSH failed — tunnel might be down, or machine is off
-    # Fall back to paired.json token staleness as a secondary signal
-    my $paired_file = '/home/oc/.openclaw/devices/paired.json';
-    unless (-f $paired_file) {
-        return {
-            status => 'unknown',
-            node   => $node_name,
-            check  => 'ssh-failed',
-            reason => "SSH unreachable (exit=$ssh_exit) and no paired devices file",
-        };
+    my $data;
+    eval { require JSON::PP; $data = JSON::PP::decode_json($out); 1 }
+        or return { status => 'unknown', node => $node_name, check => 'parse-error',
+                    reason => "nodes status JSON parse error: $@" };
+
+    my $entry;
+    for my $n (@{ $data->{nodes} // [] }) {
+        if (($n->{displayName} // '') eq $node_name) { $entry = $n; last; }
+    }
+    unless ($entry) {
+        return { status => 'offline', node => $node_name, check => 'nodes-status',
+                 hours_since_seen => '?', reason => 'node not present in gateway registry' };
     }
 
-    my $paired;
-    eval {
-        open my $fh, '<', $paired_file or die;
-        local $/;
-        my $json = <$fh>;
-        close $fh;
-        require JSON::PP;
-        $paired = JSON::PP::decode_json($json);
-    };
-    if ($@) {
-        return { status => 'unknown', node => $node_name, check => 'ssh-failed', reason => "SSH unreachable, paired.json parse error: $@" };
+    my $last_ms = $entry->{lastSeenAtMs} // $entry->{connectedAtMs};
+    my $hours_since_seen = defined $last_ms
+        ? sprintf('%.1f', (time() * 1000 - $last_ms) / 3_600_000) : '?';
+
+    if ($entry->{connected}) {
+        my $hb = "/home/oc/.vagus/state/node-heartbeat-$node_name";
+        if (open my $fh, '>', $hb) { print $fh time() . "\n"; close $fh; }
+        return { status => 'ok', node => $node_name, check => 'nodes-status',
+                 hours_since_seen => $hours_since_seen };
     }
 
-    # Find the node entry
-    my $node_entry;
-    for my $dev (values %$paired) {
-        if (($dev->{displayName} // '') eq $node_name && ($dev->{clientMode} // '') eq 'node') {
-            $node_entry = $dev;
-            last;
-        }
-    }
-
-    unless ($node_entry) {
-        return { status => 'offline', node => $node_name, check => 'ssh-failed', reason => "SSH unreachable and node not found in paired devices" };
-    }
-
-    # Check last used timestamp from the node's operator token
-    my $last_used;
-    for my $tok (values %{$node_entry->{tokens} // {}}) {
-        my $lu = $tok->{lastUsedAtMs};
-        $last_used = $lu if defined $lu && (!defined $last_used || $lu > $last_used);
-    }
-
-    my $stale_threshold_hours = $args{stale_hours} // 1;
-
-    if (defined $last_used) {
-        my $hours_since = (time() * 1000 - $last_used) / (3600 * 1000);
-        my $age_str = sprintf("%.1f", $hours_since);
-
-        if ($hours_since > $stale_threshold_hours) {
-            return {
-                status => 'offline',
-                node   => $node_name,
-                check  => 'ssh-failed+token-stale',
-                hours_since_seen => $age_str,
-                reason => "SSH unreachable and token stale (${age_str}h)",
-            };
-        }
-        return {
-            status => 'ok',
-            node   => $node_name,
-            check  => 'token-only',
-            hours_since_seen => $age_str,
-            reason => "SSH unreachable but token recent (${age_str}h) — tunnel may be down",
-        };
-    }
-
-    return {
-        status => 'offline',
-        node   => $node_name,
-        check  => 'ssh-failed+no-token',
-        reason => 'SSH unreachable and no recent token activity',
-    };
+    return { status => 'offline', node => $node_name, check => 'nodes-status',
+             hours_since_seen => $hours_since_seen,
+             reason => 'gateway reports node not connected' };
 }
 
 1;
