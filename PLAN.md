@@ -94,13 +94,13 @@ log_file: /home/oc/.openclaw/logs/vagus.log
 
 # --- Telegram ---
 telegram:
-  zeresh_bot_token: "8362453428:AAEPKBsYCMyj3BvnsbPZpuRlqs8r_J4gYqs"
-  jay_chat_id: "6554979373"
+  zeresh_bot_token: "<ZERESH_TELEGRAM_BOT_TOKEN>"
+  jay_chat_id: "<JAY_TELEGRAM_CHAT_ID>"
 
 # --- OpenClaw ---
 openclaw:
   gateway_url: "http://127.0.0.1:18789"
-  gateway_token: "43a9c99d6a1ced2eda39adc598dc4f9b747ebed17acdabe8"
+  gateway_token: "<OC_GATEWAY_TOKEN>"
 
 # --- Agents (who to wake for what) ---
 agents:

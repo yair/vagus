@@ -2,3 +2,6 @@ state/
 !state/.gitkeep
 *.log
 *.bak
+
+# local runtime config with secrets — copy from vagus.conf.example
+vagus.conf
