@@ -153,48 +153,61 @@ sub check_node {
         return { status => 'disabled', node => $node_name, reason => 'check disabled (travel/maintenance)' };
     }
 
-    # Liveness via the gateway's OWN node registry (authoritative). Replaces the old
-    # `ssh -p 2222 zeresh@localhost` probe + paired.json operator-token staleness, both
-    # of which broke when the SSH tunnel was retired for the tailnet (2026-05-28): the
-    # ssh probe failed outright, and the operator token's lastUsedAtMs tracks
-    # operation-use (frozen ~Feb), NOT connection -- so it falsely reported the node
-    # offline with a bogus "last seen 2181h" while it was in fact connected over the mesh.
-    my $oc  = $args{oc_bin} // '/home/oc/.npm-global/bin/openclaw';
-    my $out = `$oc nodes status --json 2>/dev/null`;
+    # Liveness via the LOCAL tailscale daemon — a cheap unix-socket query, NO gateway round-trip.
+    # Replaces `openclaw nodes status --json`, which cold-started a ~1.2GB-VSZ Node CLI every
+    # 10 min; when the gateway was slow those calls hung for minutes and PILED UP into an
+    # OOM/swap/load-200 storm (2026-05-29). The tailnet peer being Online is the direct
+    # equivalent of the retired ssh-tunnel probe: if the mesh peer is up, the node reaches
+    # the gateway over the mesh. `timeout` guards against a wedged tailscaled (-> 'unknown',
+    # which Rules.pm skips, so it never alerts on our own probe failing).
+    my $ts   = $args{tailscale_bin} // '/usr/bin/tailscale';
+    my $peer = $args{tailscale_peer};
+    unless (defined $peer) { ($peer = $node_name) =~ s/-.*$//; }   # 'zhizi-zeresh' -> 'zhizi'
+    my $out  = `timeout 10 $ts status --json 2>/dev/null`;
     my $exit = $? >> 8;
     if ($exit != 0 || !length $out) {
-        return { status => 'unknown', node => $node_name, check => 'gateway-unreachable',
-                 reason => "could not query 'openclaw nodes status' (exit=$exit)" };
+        return { status => 'unknown', node => $node_name, check => 'tailscale-unreachable',
+                 reason => "could not query 'tailscale status' (exit=$exit)" };
     }
 
     my $data;
     eval { require JSON::PP; $data = JSON::PP::decode_json($out); 1 }
         or return { status => 'unknown', node => $node_name, check => 'parse-error',
-                    reason => "nodes status JSON parse error: $@" };
+                    reason => "tailscale status JSON parse error: $@" };
 
+    my $lpeer = lc($peer);
     my $entry;
-    for my $n (@{ $data->{nodes} // [] }) {
-        if (($n->{displayName} // '') eq $node_name) { $entry = $n; last; }
+    for my $p (values %{ $data->{Peer} // {} }) {
+        my $host = lc($p->{HostName} // '');
+        my $dns  = lc($p->{DNSName}  // '');
+        if ($host eq $lpeer || $dns =~ /^\Q$lpeer\E\./) { $entry = $p; last; }
     }
     unless ($entry) {
-        return { status => 'offline', node => $node_name, check => 'nodes-status',
-                 hours_since_seen => '?', reason => 'node not present in gateway registry' };
+        return { status => 'offline', node => $node_name, check => 'tailscale',
+                 hours_since_seen => '?', reason => "peer '$peer' not present in tailnet" };
     }
 
-    my $last_ms = $entry->{lastSeenAtMs} // $entry->{connectedAtMs};
-    my $hours_since_seen = defined $last_ms
-        ? sprintf('%.1f', (time() * 1000 - $last_ms) / 3_600_000) : '?';
-
-    if ($entry->{connected}) {
+    if ($entry->{Online}) {
         my $hb = "/home/oc/.vagus/state/node-heartbeat-$node_name";
         if (open my $fh, '>', $hb) { print $fh time() . "\n"; close $fh; }
-        return { status => 'ok', node => $node_name, check => 'nodes-status',
-                 hours_since_seen => $hours_since_seen };
+        return { status => 'ok', node => $node_name, check => 'tailscale',
+                 hours_since_seen => '0.0' };
     }
 
-    return { status => 'offline', node => $node_name, check => 'nodes-status',
+    # Offline: derive hours since LastSeen (RFC3339 UTC; zero-value "0001-..." when online/never).
+    my $hours_since_seen = '?';
+    my $ls = $entry->{LastSeen} // '';
+    if ($ls =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/ && $1 > 1970) {
+        eval {
+            require Time::Local;
+            my $epoch = Time::Local::timegm($6, $5, $4, $3, $2 - 1, $1);
+            $hours_since_seen = sprintf('%.1f', (time() - $epoch) / 3600);
+            1;
+        };
+    }
+    return { status => 'offline', node => $node_name, check => 'tailscale',
              hours_since_seen => $hours_since_seen,
-             reason => 'gateway reports node not connected' };
+             reason => 'tailnet peer offline' };
 }
 
 1;
